@@ -155,6 +155,10 @@ Any stdio MCP client accepts the same fields: `command = "uv"`, `args = ["--dire
 
 The server keeps a separate connection pool per environment, so switching does not require a restart.
 
+## Hardening: dedicated read-only role
+
+The MCP enforces read-only at the application layer (parse-time validator, `SET TRANSACTION READ ONLY`, dangerous-function blacklist). The strongest fourth layer is a Postgres role with `SELECT`-only grants — the database itself refuses writes even if every line of Python were replaced. See [docs/database-role-setup.md](./docs/database-role-setup.md) for the minimal setup, triage query examples, and the optional view-based pattern for redacting sensitive columns without changing MCP code.
+
 ## Tests
 
 See [CLAUDE.md](./CLAUDE.md#testing) for the regression suite (unit + integration).

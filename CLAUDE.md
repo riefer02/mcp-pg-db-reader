@@ -46,6 +46,10 @@ docker stop mcp_test_pg
 
 The integration fixture (`mcp_env` in `tests/conftest.py`) creates a unique throwaway schema, sets `DB_ALLOWED_SCHEMAS` to it, reloads the module, and clears the engine cache — tests can safely run against any Postgres without touching `public`.
 
+## Operational hardening
+
+See [docs/database-role-setup.md](./docs/database-role-setup.md) for the recommended deployment posture: dedicated `SELECT`-only Postgres role, optional redaction views for PHI/PII, verification queries, and the per-engine portability notes. The MCP's app-layer protections (validator, READ ONLY transaction, function blacklist) are best paired with a DB role that has no write grants — that turns "writes are blocked in four places" into a real four-layer wall.
+
 ## Key dependencies
 
 - `mcp[cli]>=1.26.0` — FastMCP
