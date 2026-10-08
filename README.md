@@ -17,6 +17,8 @@ A Model Context Protocol (MCP) server for read-only PostgreSQL access over stdio
 - An MCP-compatible client (Cursor, Claude Desktop, Codex, ...)
 - [`uv`](https://docs.astral.sh/uv/) for project management
 
+The official Python MCP SDK is constrained to its maintained v1 line (`mcp[cli]>=1.30.0,<2`); v2 is a breaking upgrade and is intentionally excluded until this server is migrated.
+
 ## Install
 
 ```bash
@@ -38,9 +40,11 @@ Every MCP tool also accepts an `environment` argument to override per-call witho
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DB_STATEMENT_TIMEOUT_MS` | `60000` | Per-query timeout |
+| `DB_MAX_STATEMENT_TIMEOUT_MS` | `300000` (or `DB_STATEMENT_TIMEOUT_MS` if higher) | Maximum per-call timeout; must be at least `DB_STATEMENT_TIMEOUT_MS` |
 | `DB_LOCK_TIMEOUT_MS` | `15000` | Lock acquisition timeout |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | `60000` | Kills idle-in-txn sessions |
 | `DB_MAX_ROWS` | `10000` | Hard row cap (truncation flagged in response) |
+| `DB_TOOL_CALLS_PER_MINUTE` | `120` | Per-process sliding-window limit for MCP tool calls |
 | `DB_FETCHMANY_SIZE` | `1000` | Batch fetch size while streaming |
 | `DB_POOL_SIZE` | `5` | Connections per environment |
 | `DB_MAX_OVERFLOW` | `2` | Pool overflow |
@@ -53,11 +57,11 @@ Every MCP tool also accepts an `environment` argument to override per-call witho
 | Tool | Purpose |
 |------|---------|
 | `health_check` | Database + server connectivity check |
-| `database_query` | Run a read-only SQL query (SELECT/WITH); supports `max_rows`, `offset`, `statement_timeout_ms`, `environment` |
+| `database_query` | Run a read-only SQL query (SELECT/WITH); supports bound `params`, `max_rows`, `offset`, `statement_timeout_ms`, `environment` |
 | `explain_query` | `EXPLAIN [ANALYZE]` for a query, JSON plan |
 | `list_tables` | Tables in the chosen schema |
 | `get_table_schema` | Columns + primary keys for one table |
-| `get_all_schemas` | Bulk dump: columns + primary keys (2 queries total) and optional `sample_data` |
+| `get_all_schemas` | Bulk dump: columns + primary keys (2 queries total); `sample_data` is opt-in via `include_samples=true` |
 
 `database_query` response shape:
 
@@ -73,6 +77,19 @@ Every MCP tool also accepts an `environment` argument to override per-call witho
   "environment": "default"
 }
 ```
+
+`max_rows` is clamped to `DB_MAX_ROWS`. Per-call `statement_timeout_ms` must be positive and no greater than `DB_MAX_STATEMENT_TIMEOUT_MS`.
+
+Pass query values separately in `params` rather than interpolating them into SQL:
+
+```json
+{
+  "query": "SELECT id, name FROM users WHERE email = :email",
+  "params": {"email": "user@example.com"}
+}
+```
+
+The internal bind names `_row_limit` and `_row_offset` are reserved for server pagination.
 
 ## Client setup
 
@@ -161,7 +178,7 @@ The MCP enforces read-only at the application layer (parse-time validator, `SET 
 
 ## Tests
 
-See [CLAUDE.md](./CLAUDE.md#testing) for the regression suite (unit + integration).
+See [AGENTS.md](./AGENTS.md#verification) for the regression suite (unit + integration).
 
 ## Notes
 

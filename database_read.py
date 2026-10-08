@@ -7,12 +7,14 @@ import json
 import atexit
 import base64
 import threading
+from collections import deque
 from datetime import datetime, timezone, date, time as dtime
 from decimal import Decimal
 from uuid import UUID
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 import signal
 import sqlparse
 from sqlparse import tokens as T
@@ -42,6 +44,43 @@ DEFAULT_IDLE_IN_TXN_TIMEOUT_MS = int(
 )
 DEFAULT_MAX_ROWS = int(os.getenv("DB_MAX_ROWS", "10000"))
 DEFAULT_FETCHMANY_SIZE = int(os.getenv("DB_FETCHMANY_SIZE", "1000"))
+MAX_STATEMENT_TIMEOUT_MS = int(
+    os.getenv(
+        "DB_MAX_STATEMENT_TIMEOUT_MS",
+        str(max(DEFAULT_STATEMENT_TIMEOUT_MS, 300000)),
+    )
+)
+TOOL_CALLS_PER_MINUTE = int(os.getenv("DB_TOOL_CALLS_PER_MINUTE", "120"))
+
+if DEFAULT_STATEMENT_TIMEOUT_MS <= 0:
+    raise ValueError("DB_STATEMENT_TIMEOUT_MS must be > 0")
+if DEFAULT_MAX_ROWS <= 0:
+    raise ValueError("DB_MAX_ROWS must be > 0")
+if MAX_STATEMENT_TIMEOUT_MS < DEFAULT_STATEMENT_TIMEOUT_MS:
+    raise ValueError(
+        "DB_MAX_STATEMENT_TIMEOUT_MS must be >= DB_STATEMENT_TIMEOUT_MS"
+    )
+if TOOL_CALLS_PER_MINUTE <= 0:
+    raise ValueError("DB_TOOL_CALLS_PER_MINUTE must be > 0")
+
+_READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(readOnlyHint=True)
+_TOOL_CALL_TIMESTAMPS = deque()
+_TOOL_RATE_LIMIT_LOCK = threading.Lock()
+
+
+def _enforce_tool_rate_limit() -> None:
+    """Apply a process-local sliding-window limit to exposed MCP tool calls."""
+    now = time.monotonic()
+    cutoff = now - 60.0
+    with _TOOL_RATE_LIMIT_LOCK:
+        while _TOOL_CALL_TIMESTAMPS and _TOOL_CALL_TIMESTAMPS[0] <= cutoff:
+            _TOOL_CALL_TIMESTAMPS.popleft()
+        if len(_TOOL_CALL_TIMESTAMPS) >= TOOL_CALLS_PER_MINUTE:
+            raise ValueError(
+                "Tool call rate limit exceeded; try again after the current "
+                "one-minute window"
+            )
+        _TOOL_CALL_TIMESTAMPS.append(now)
 
 POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
 MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "2"))
@@ -217,6 +256,7 @@ _DANGEROUS_FUNCS = {
 }
 
 _TRAILING_SEMI_RE = re.compile(r";\s*$")
+_RESERVED_QUERY_PARAMS = {"_row_limit", "_row_offset"}
 
 
 def _normalize_ident_value(value: str) -> str:
@@ -410,6 +450,30 @@ def _quote_ident(ident: str) -> str:
     return '"' + ident + '"'
 
 
+def _effective_max_rows(requested: Optional[int]) -> int:
+    """Validate a requested row count and enforce DB_MAX_ROWS as a hard cap."""
+    if requested is None:
+        return DEFAULT_MAX_ROWS
+    if requested <= 0:
+        raise ValueError("max_rows must be > 0")
+    return min(requested, DEFAULT_MAX_ROWS)
+
+
+def _effective_statement_timeout(requested: Optional[int]) -> int:
+    """Validate a per-query timeout against the configured hard ceiling."""
+    timeout_ms = (
+        requested if requested is not None else DEFAULT_STATEMENT_TIMEOUT_MS
+    )
+    if timeout_ms <= 0:
+        raise ValueError("statement_timeout_ms must be > 0")
+    if timeout_ms > MAX_STATEMENT_TIMEOUT_MS:
+        raise ValueError(
+            "statement_timeout_ms must be <= "
+            f"DB_MAX_STATEMENT_TIMEOUT_MS ({MAX_STATEMENT_TIMEOUT_MS})"
+        )
+    return timeout_ms
+
+
 def execute_query(
     query: str,
     params: Optional[Dict[str, Any]] = None,
@@ -428,14 +492,16 @@ def execute_query(
     if offset < 0:
         raise ValueError("offset must be >= 0")
 
-    effective_max_rows = max_rows if max_rows is not None else DEFAULT_MAX_ROWS
-    if effective_max_rows <= 0:
-        raise ValueError("max_rows must be > 0")
-    effective_timeout_ms = (
-        statement_timeout_ms
-        if statement_timeout_ms is not None
-        else DEFAULT_STATEMENT_TIMEOUT_MS
-    )
+    effective_max_rows = _effective_max_rows(max_rows)
+    effective_timeout_ms = _effective_statement_timeout(statement_timeout_ms)
+
+    exec_params = dict(params or {})
+    reserved_params = sorted(_RESERVED_QUERY_PARAMS.intersection(exec_params))
+    if reserved_params:
+        raise ValueError(
+            "Query parameter names are reserved by the server: "
+            + ", ".join(reserved_params)
+        )
 
     engine = _get_engine(environment)
     target_env = _resolve_requested_environment(environment)
@@ -444,7 +510,6 @@ def execute_query(
     # Fetch max_rows+1 to detect truncation
     fetch_limit = effective_max_rows + 1
     safe_query = _wrap_select_with_limit_offset(query)
-    exec_params = dict(params or {})
     exec_params["_row_limit"] = fetch_limit
     exec_params["_row_offset"] = offset
 
@@ -502,7 +567,7 @@ def execute_query(
                 duration_ms=elapsed_ms,
                 row_count=len(rows),
                 truncated=truncated,
-                query_preview=query[:100],
+                query_length=len(query),
             )
             return rows, truncated
         except (QueryCancelled, TimeoutError) as e:
@@ -512,8 +577,7 @@ def execute_query(
                 environment=target_env,
                 duration_ms=elapsed_ms,
                 error_type=type(e).__name__,
-                error_message=str(e),
-                query_preview=query[:100],
+                query_length=len(query),
             )
             try:
                 _attempt_cancel(connection)
@@ -527,8 +591,7 @@ def execute_query(
                 environment=target_env,
                 duration_ms=elapsed_ms,
                 error_type=type(e).__name__,
-                error_message=str(e),
-                query_preview=query[:100],
+                query_length=len(query),
             )
             trans.rollback()
             raise
@@ -592,11 +655,12 @@ def get_primary_keys(
 # ---------- MCP Tools ----------
 
 
-@mcp.tool("health_check")
+@mcp.tool("health_check", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 def handle_health_check(environment: Optional[str] = None) -> Dict[str, Any]:
     """Check database connectivity and server health."""
     target_env = _resolve_requested_environment(environment)
     try:
+        _enforce_tool_rate_limit()
         engine = _get_engine(environment)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1")).fetchone()
@@ -606,6 +670,8 @@ def handle_health_check(environment: Optional[str] = None) -> Dict[str, Any]:
             "available_environments": sorted(DATABASE_URLS.keys()),
             "pool_size": POOL_SIZE,
             "statement_timeout_ms": DEFAULT_STATEMENT_TIMEOUT_MS,
+            "max_statement_timeout_ms": MAX_STATEMENT_TIMEOUT_MS,
+            "tool_calls_per_minute": TOOL_CALLS_PER_MINUTE,
             "max_rows": DEFAULT_MAX_ROWS,
             "allowed_schemas": list(ALLOWED_SCHEMAS),
         }
@@ -613,24 +679,28 @@ def handle_health_check(environment: Optional[str] = None) -> Dict[str, Any]:
         return {"status": "unhealthy", "environment": target_env, "error": str(e)}
 
 
-@mcp.tool("database_query")
+@mcp.tool("database_query", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 def handle_database_query(
     query: str,
     environment: Optional[str] = None,
     max_rows: Optional[int] = None,
     offset: int = 0,
     statement_timeout_ms: Optional[int] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Execute a read-only SQL query (SELECT/WITH only)."""
+    """Execute a read-only SQL query (SELECT/WITH only), with optional bind params."""
     try:
+        _enforce_tool_rate_limit()
+        effective_max = _effective_max_rows(max_rows)
+        effective_timeout = _effective_statement_timeout(statement_timeout_ms)
         rows, truncated = execute_query(
             query,
+            params=params,
             environment=environment,
-            max_rows=max_rows,
+            max_rows=effective_max,
             offset=offset,
-            statement_timeout_ms=statement_timeout_ms,
+            statement_timeout_ms=effective_timeout,
         )
-        effective_max = max_rows if max_rows is not None else DEFAULT_MAX_ROWS
         return {
             "status": "success",
             "results": rows,
@@ -638,18 +708,14 @@ def handle_database_query(
             "truncated": truncated,
             "offset": offset,
             "max_rows": effective_max,
-            "statement_timeout_ms": (
-                statement_timeout_ms
-                if statement_timeout_ms is not None
-                else DEFAULT_STATEMENT_TIMEOUT_MS
-            ),
+            "statement_timeout_ms": effective_timeout,
             "environment": _resolve_requested_environment(environment),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-@mcp.tool("explain_query")
+@mcp.tool("explain_query", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 def handle_explain_query(
     query: str,
     analyze: bool = False,
@@ -660,6 +726,7 @@ def handle_explain_query(
     Always read-only; validator rejects writes.
     """
     try:
+        _enforce_tool_rate_limit()
         validate_read_only_sql(query)
         inner = _strip_trailing_semicolon(query)
         prefix = "EXPLAIN (FORMAT JSON, ANALYZE)" if analyze else "EXPLAIN (FORMAT JSON)"
@@ -691,12 +758,13 @@ def handle_explain_query(
         return {"status": "error", "message": str(e)}
 
 
-@mcp.tool("list_tables")
+@mcp.tool("list_tables", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 def handle_list_tables(
     environment: Optional[str] = None, schema: Optional[str] = None
 ) -> Dict[str, Any]:
     """List tables in the given schema (defaults to first allowed schema)."""
     try:
+        _enforce_tool_rate_limit()
         target_schema = _validate_schema(schema)
         tables = get_table_names(environment=environment, schema=target_schema)
         return {
@@ -709,7 +777,7 @@ def handle_list_tables(
         return {"status": "error", "message": str(e)}
 
 
-@mcp.tool("get_table_schema")
+@mcp.tool("get_table_schema", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 def handle_get_table_schema(
     table_name: str,
     environment: Optional[str] = None,
@@ -717,6 +785,7 @@ def handle_get_table_schema(
 ) -> Dict[str, Any]:
     """Get column metadata + primary keys for a table."""
     try:
+        _enforce_tool_rate_limit()
         target_schema = _validate_schema(schema)
         cols = get_table_schema(table_name, environment=environment, schema=target_schema)
         pks = get_primary_keys(table_name, environment=environment, schema=target_schema)
@@ -731,11 +800,11 @@ def handle_get_table_schema(
         return {"status": "error", "message": str(e)}
 
 
-@mcp.tool("get_all_schemas")
+@mcp.tool("get_all_schemas", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 def handle_get_all_schemas(
     environment: Optional[str] = None,
     schema: Optional[str] = None,
-    include_samples: bool = True,
+    include_samples: bool = False,
     sample_rows: int = 5,
 ) -> Dict[str, Any]:
     """
@@ -743,6 +812,7 @@ def handle_get_all_schemas(
     Optionally include LIMIT-N samples (one query per table; set include_samples=False to skip).
     """
     try:
+        _enforce_tool_rate_limit()
         target_schema = _validate_schema(schema)
 
         cols, _ = execute_query(
@@ -827,6 +897,8 @@ if __name__ == "__main__":
         "server_starting",
         environments=sorted(DATABASE_URLS.keys()),
         statement_timeout_ms=DEFAULT_STATEMENT_TIMEOUT_MS,
+        max_statement_timeout_ms=MAX_STATEMENT_TIMEOUT_MS,
+        tool_calls_per_minute=TOOL_CALLS_PER_MINUTE,
         max_rows=DEFAULT_MAX_ROWS,
         pool_size=POOL_SIZE,
         allowed_schemas=list(ALLOWED_SCHEMAS),

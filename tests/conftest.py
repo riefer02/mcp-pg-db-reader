@@ -20,6 +20,15 @@ sys.path.insert(0, str(REPO_ROOT))
 os.environ.setdefault("DATABASE_URL", "postgresql://placeholder:placeholder@localhost:5432/placeholder")
 
 
+@pytest.fixture(autouse=True)
+def reset_tool_rate_limit():
+    """Keep rate-limit state isolated between tests."""
+    import database_read as db
+
+    with db._TOOL_RATE_LIMIT_LOCK:
+        db._TOOL_CALL_TIMESTAMPS.clear()
+
+
 def _integration_url() -> str | None:
     return os.environ.get("MCP_TEST_DATABASE_URL")
 

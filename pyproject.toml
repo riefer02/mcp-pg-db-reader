@@ -4,7 +4,7 @@ version = "1.1.0"
 description = "Read-only PostgreSQL MCP server"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.26.0",
+    "mcp[cli]>=1.30.0,<2",
     "sqlalchemy>=2.0.39",
     "psycopg2-binary>=2.9.10",
     "sqlparse>=0.4.4",
