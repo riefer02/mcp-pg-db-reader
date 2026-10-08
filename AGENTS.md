@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Developer-facing notes for working on this repo. For user-facing setup, configuration, tool list, and env var reference, see [README.md](./README.md).
 
