@@ -178,7 +178,7 @@ The MCP enforces read-only at the application layer (parse-time validator, `SET 
 
 ## Tests
 
-See [AGENTS.md](./AGENTS.md#testing) for the regression suite (unit + integration).
+See [AGENTS.md](./AGENTS.md#verification) for the regression suite (unit + integration).
 
 ## Notes
 
