@@ -66,6 +66,27 @@ def test_database_query_basic(mcp_env, fresh_schema):
     assert out["truncated"] is False
 
 
+def test_database_query_bound_params(mcp_env):
+    value = "O'Reilly"
+    out = mcp_env.handle_database_query(
+        "SELECT :value AS value", params={"value": value}
+    )
+    assert out["status"] == "success"
+    assert out["results"] == [{"value": value}]
+
+
+def test_database_query_enforces_hard_row_cap(mcp_env, fresh_schema, monkeypatch):
+    monkeypatch.setattr(mcp_env, "DEFAULT_MAX_ROWS", 2)
+    out = mcp_env.handle_database_query(
+        f'SELECT id FROM "{fresh_schema}".widgets ORDER BY id', max_rows=100
+    )
+
+    assert out["status"] == "success"
+    assert out["max_rows"] == 2
+    assert out["count"] == 2
+    assert out["truncated"] is True
+
+
 def test_database_query_pagination(mcp_env, fresh_schema):
     page1 = mcp_env.handle_database_query(
         f'SELECT id FROM "{fresh_schema}".widgets ORDER BY id',

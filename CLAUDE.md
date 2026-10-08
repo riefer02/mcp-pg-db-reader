@@ -14,10 +14,10 @@ Read-only PostgreSQL MCP server over stdio. Single-file server at `database_read
 2. **Env discovery** (`_discover_database_urls`, `_normalize_env_name`) — turns `DATABASE_URL_<ENV>` vars into a name→URL map, with alias normalization (`dev`→`local`, `prod`→`production`, ...).
 3. **Engine cache** (`_get_engine`) — lazy, thread-safe, per-environment SQLAlchemy engines. `atexit` disposes all on shutdown.
 4. **SQL safety** (`validate_read_only_sql`) — `sqlparse`-based: strips comments, rejects multi-statement payloads, rejects non-`SELECT`/`WITH` starters, walks all tokens to block any `Keyword.DDL`, write `Keyword.DML` (`INSERT`/`UPDATE`/`DELETE`/`MERGE`/...), or `_BLOCKED_ANY` keyword (`INTO`, which catches `SELECT * INTO new_t FROM ...`). Replaces the old word-boundary regex which false-positived on identifiers like `is_deleted`. Defense in depth: the wrapped query always runs in a `SET TRANSACTION READ ONLY` transaction, so even a bypassed validator cannot mutate state.
-5. **Query execution** (`execute_query`) — wraps the user query as `SELECT * FROM (q) AS _mcp_sub LIMIT :n+1 OFFSET :o`, runs inside a `READ ONLY` transaction with `SET LOCAL` timeouts, streams results in batches, detects truncation via the extra row, and emits `query_executed` / `query_failed` log events. Signal handlers (`SIGINT`/`SIGTERM`) only install when running on the main thread.
+5. **Query execution** (`execute_query`) — wraps the user query as `SELECT * FROM (q) AS _mcp_sub LIMIT :n+1 OFFSET :o`, accepts bound params (reserving the pagination bind names), runs inside a `READ ONLY` transaction with bounded `SET LOCAL` timeouts, streams results in batches, enforces `DB_MAX_ROWS` as a hard ceiling, detects truncation via the extra row, and logs query length without SQL text. Signal handlers (`SIGINT`/`SIGTERM`) only install when running on the main thread.
 6. **Schema allowlist** (`_validate_schema`, `_quote_ident`) — every tool that takes a `schema` arg goes through the allowlist (`DB_ALLOWED_SCHEMAS`, default `public`). Identifiers used in unparameterized SQL go through `_quote_ident`, which rejects embedded `"` and `\0`.
 7. **Row serialization** (`_jsonify_value`) — converts `Decimal`/`UUID`/`datetime`/`date`/`time`/`bytes`/nested containers into JSON-safe primitives before MCP returns them.
-8. **MCP tools** — thin wrappers that call `execute_query` and shape responses; errors are returned as `{"status": "error", "message": ...}` rather than raising.
+8. **MCP tools** — thin wrappers that call `execute_query` and shape responses; all advertise the read-only annotation and share a per-process sliding-window rate limit. Errors are returned as `{"status": "error", "message": ...}` rather than raising.
 
 ## Running the server
 
@@ -52,7 +52,7 @@ See [docs/database-role-setup.md](./docs/database-role-setup.md) for the recomme
 
 ## Key dependencies
 
-- `mcp[cli]>=1.26.0` — FastMCP
+- `mcp[cli]>=1.30.0,<2` — maintained v1 FastMCP line; v2 is intentionally excluded pending migration
 - `SQLAlchemy>=2.0.39` — engine + Core
 - `psycopg2-binary>=2.9.10` — PG driver
 - `sqlparse>=0.4.4` — write/multi-statement detection
